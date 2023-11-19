@@ -70,18 +70,14 @@ impl<I: Iterator<Item=Token>> Parser<I> {
 
     fn term(&mut self) -> Result<Op, ParseError> {
         use Token::*;
-        let &token = self.tokens.peek().ok_or(ReachedEOF)?;
-        match token {
+        match self.tokens.next().ok_or(ReachedEOF)? {
             Const(b) => {
-                let _parsed = self.tokens.next();
                 Ok(Op::Const(b))
             }
             Var(c) => {
-                let _parsed = self.tokens.next();
                 Ok(Op::Var(c))
             }
             LParen => {
-                let _parsed = self.tokens.next();
                 let expr = self.expr();
                 self.tokens.next_if(|t| matches!(t, Token::RParen)).ok_or(ExpectedCloseParent).and(expr)
             }
@@ -123,7 +119,11 @@ impl<I: Iterator<Item=Token>> Parser<I> {
         use Op::*;
         let mut lhs = self.not()?;
         while self.tokens.next_if(|t| matches!(t, Token::Caret)).is_some() {
-            lhs = Xor(Box::new(lhs), Box::new(self.not()?));
+            let rhs = self.not()?;
+            lhs = match (lhs, rhs) {
+                (Var(v1), Var(v2)) if v1 == v2 => Const(false),
+                (lhs, rhs) => Xor(Box::new(lhs), Box::new(rhs))
+            };
         }
         Ok(lhs)
     }
@@ -222,7 +222,7 @@ fn tokenize(input: &str) -> Vec<Token> {
         '^' => Some(Caret),
         '(' => Some(LParen),
         ')' => Some(RParen),
-        v if v.is_ascii_alphabetic() => Some(Var(v.to_ascii_uppercase())),
+        v if v.is_alphabetic() => Some(Var(v.to_ascii_uppercase())),
         ws if ws.is_whitespace() => None,
         _ => panic!("Unknown character `{c} as index {index}`")
     }).collect()
