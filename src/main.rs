@@ -166,7 +166,7 @@ enum Op {
 impl Op {
     fn variables(&self) -> HashSet<char> {
         match self {
-            Op::Const(_) => HashSet::with_capacity(0),
+            Op::Const(_) => HashSet::new(),
             Op::Var(name) => HashSet::from([*name]),
             Op::Not(op) => op.variables(),
             Op::Or(a, b) | Op::And(a, b) | Op::Xor(a, b) => moving_union(a.variables(), b.variables())
