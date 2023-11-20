@@ -5,7 +5,9 @@ use std::fmt::{Display, Formatter, Write};
 use std::hash::Hash;
 use std::io::stdin;
 use std::iter::Peekable;
+use std::ops::Not;
 use crate::ParseError::{ExpectedCloseParent, ExpectedExpr, ReachedEOF, UnexpectedToken};
+use crate::TokenizingError::UnexpectedChar;
 
 #[derive(Debug)]
 enum ParseError {
@@ -27,7 +29,7 @@ fn main() -> anyhow::Result<()> {
     println!("Enter expression");
     let line = read_line()?;
     let tokens = tokenize(&line);
-    let mut parser = Parser::new(tokens.into_iter());
+    let mut parser = Parser::new(tokens?.into_iter());
     let expr = parser.expr()?;
     let vars_names = {
         let mut v = expr.variables().into_iter().collect::<Vec<_>>();
@@ -39,7 +41,8 @@ fn main() -> anyhow::Result<()> {
     println!("{}FN", vars_names.iter().flat_map(|&c| [c, '\t']).collect::<String>());
     for i in 0..2usize.pow(vars_count as u32) {
         let binary = format!("{i:b}");
-        let mut chars = binary.chars().map(digit_to_bool);
+        let mut chars = binary.chars()
+            .map(|c| c.to_digit(2).expect("converting digits of binary number cannot fail") == 0);
         let vars = HashMap::from_iter(vars_names.iter().map(|c| (*c, chars.next_back().unwrap_or(false))));
         print!("{}", vars_names.iter().flat_map(|c| [bool_digit(*vars.get(c).unwrap_or(&false)), '\t']).collect::<String>());
         println!("{}", bool_digit(expr.eval(&vars).unwrap()));
@@ -71,12 +74,8 @@ impl<I: Iterator<Item=Token>> Parser<I> {
     fn term(&mut self) -> Result<Op, ParseError> {
         use Token::*;
         match self.tokens.next().ok_or(ReachedEOF)? {
-            Const(b) => {
-                Ok(Op::Const(b))
-            }
-            Var(c) => {
-                Ok(Op::Var(c))
-            }
+            Const(b) => Ok(Op::Const(b)),
+            Var(c) => Ok(Op::Var(c)),
             LParen => {
                 let expr = self.expr();
                 self.tokens.next_if(|t| matches!(t, Token::RParen)).ok_or(ExpectedCloseParent).and(expr)
@@ -178,7 +177,7 @@ impl Op {
         match self {
             Op::Const(b) => Some(*b),
             Op::Var(c) => vars.get(c).copied(),
-            Op::Not(op) => op.eval(vars).map(|b| !b),
+            Op::Not(op) => op.eval(vars).map(bool::not),
             Op::Or(a, b) => Some((a.eval(vars)?) || (b.eval(vars)?)),
             Op::And(a, b) => Some((a.eval(vars)?) && (b.eval(vars)?)),
             Op::Xor(a, b) => Some((a.eval(vars)?) ^ (b.eval(vars)?)),
@@ -212,45 +211,41 @@ impl Display for Op {
     }
 }
 
-fn tokenize(input: &str) -> Vec<Token> {
+#[derive(Debug)]
+enum TokenizingError {
+    UnexpectedChar(char, usize)
+}
+
+impl Display for TokenizingError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TokenizingError::UnexpectedChar(char, index) => f.write_fmt(format_args!("Unexpected character `{char}` at index {index}"))
+        }
+    }
+}
+
+impl Error for TokenizingError {}
+
+fn tokenize(input: &str) -> Result<Vec<Token>, TokenizingError> {
     use Token::*;
-    input.chars().enumerate().filter_map(|(index, c)| match c {
-        '1' | '0' => Some(Const(c == '1')),
-        '!' => Some(Bang),
-        '+' => Some(Plus),
-        '*' => Some(Star),
-        '^' => Some(Caret),
-        '(' => Some(LParen),
-        ')' => Some(RParen),
-        v if v.is_alphabetic() => Some(Var(v.to_ascii_uppercase())),
-        ws if ws.is_whitespace() => None,
-        _ => panic!("Unknown character `{c} as index {index}`")
-    }).collect()
+    input.chars().enumerate().map(|(index, c)| match c {
+        '1' | '0' => Ok(Some(Const(c == '1'))),
+        '!' => Ok(Some(Bang)),
+        '+' => Ok(Some(Plus)),
+        '*' => Ok(Some(Star)),
+        '^' => Ok(Some(Caret)),
+        '(' => Ok(Some(LParen)),
+        ')' => Ok(Some(RParen)),
+        v if v.is_alphabetic() => Ok(Some(Var(v.to_ascii_uppercase()))),
+        ws if ws.is_whitespace() => Ok(None),
+        _ => Err(UnexpectedChar(c, index))
+    })
+        .collect::<Result<Vec<_>, TokenizingError>>()
+        .map(|v| v.into_iter().filter_map(|t| t).collect())
 }
 
 const MACRON: char = '\u{0304}';
 
-trait NextIfSome<T, R> {
-    fn next_if_some<F>(&mut self, block: F) -> Option<R> where F: FnOnce(&T) -> Option<R>;
-}
-
-impl<T, R, I: Iterator<Item=T>> NextIfSome<T, R> for Peekable<I> {
-    fn next_if_some<F>(&mut self, block: F) -> Option<R> where F: FnOnce(&T) -> Option<R> {
-        self.peek().and_then(block).map(|t| {
-            self.next();
-            t
-        })
-    }
-}
-
 fn bool_digit(b: bool) -> char {
     if b { '1' } else { '0' }
-}
-
-fn digit_to_bool(digit: char) -> bool {
-    match digit {
-        '0' => false,
-        '1' => true,
-        _ => panic!("Invalid bool digit {digit}")
-    }
 }
