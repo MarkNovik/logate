@@ -28,31 +28,36 @@ impl Error for ParseError {}
 fn main() -> anyhow::Result<()> {
     println!("Enter expression");
     let line = read_line()?;
-    let tokens = tokenize(&line);
-    let mut parser = Parser::new(tokens?.into_iter());
+    let tokens = tokenize(&line)?;
+    let mut parser = Parser::new(tokens.into_iter());
     let expr = parser.expr()?;
+    println!("FN = {}", expr);
+    print_truth_table(&expr);
+    println!();
+    Ok(())
+}
+
+// 00 01 10 11
+fn print_truth_table(expr: &Op) {
     let vars_names = {
         let mut v = expr.variables().into_iter().collect::<Vec<_>>();
         v.sort();
         v
     };
     let vars_count = vars_names.len();
-    println!("FN = {}", expr);
     println!("{}FN", vars_names.iter().flat_map(|&c| [c, '\t']).collect::<String>());
     for i in 0..2usize.pow(vars_count as u32) {
-        let binary = format!("{i:b}");
-        let mut chars = binary.chars()
-            .map(|c| c.to_digit(2).expect("converting digits of binary number cannot fail") == 0);
-        let vars = HashMap::from_iter(vars_names.iter().map(|c| (*c, chars.next_back().unwrap_or(false))));
+        let binary = format!("{i:0>n$b}", n = vars_count);
+        let vars = HashMap::from_iter(vars_names.iter().zip(binary.chars()).map(|(&var, val)| (var, val == '1')));
         print!("{}", vars_names.iter().flat_map(|c| [bool_digit(*vars.get(c).unwrap_or(&false)), '\t']).collect::<String>());
         println!("{}", bool_digit(expr.eval(&vars).unwrap()));
     }
-    Ok(())
 }
 
 fn read_line() -> anyhow::Result<String> {
     let mut buf = String::new();
     let _ = stdin().read_line(&mut buf)?;
+    buf.remove(buf.len() - 1);
     Ok(buf)
 }
 
