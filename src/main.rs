@@ -57,8 +57,7 @@ fn print_truth_table(expr: &Op) {
 fn read_line() -> anyhow::Result<String> {
     let mut buf = String::new();
     let _ = stdin().read_line(&mut buf)?;
-    buf.remove(buf.len() - 1);
-    Ok(buf)
+    Ok(buf.trim_end_matches(|c| c == '\n').to_string())
 }
 
 struct Parser<I: Iterator<Item=Token>> {
