@@ -1,13 +1,77 @@
-use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
+use std::collections::hash_map::RandomState;
 use std::error::Error;
 use std::fmt::{Display, Formatter, Write};
 use std::hash::Hash;
 use std::io::stdin;
 use std::iter::Peekable;
 use std::ops::Not;
+
+use itertools::Itertools;
+
 use crate::ParseError::{ExpectedCloseParent, ExpectedExpr, ReachedEOF, UnexpectedToken};
 use crate::TokenizingError::UnexpectedChar;
+
+const MACRON: char = '\u{0304}';
+
+fn main() -> anyhow::Result<()> {
+    println!("Enter expression");
+    let line = read_line()?;
+    let tokens = tokenize(&line)?;
+    let mut parser = Parser::new(tokens.into_iter());
+    let expr = parser.expr()?;
+    println!("FN = {}", expr);
+    print_truth_table(&expr);
+    println!();
+    Ok(())
+}
+
+fn read_line() -> anyhow::Result<String> {
+    let mut buf = String::new();
+    let _ = stdin().read_line(&mut buf)?;
+    Ok(buf.trim_end_matches(|c| c == '\n').to_string())
+}
+
+
+fn print_truth_table(expr: &Op) {
+    let vars = Vars::new(expr.variables().into_iter().sorted().collect());
+    println!("{}FN", vars.names().iter().flat_map(|&c| [c, '\t']).collect::<String>());
+    vars.for_each(|state| {
+        //dbg!(&state);
+        print!("{}", state.keys().sorted().flat_map(|b| [bool_digit(*state.get(b).expect("The key is gotten from this map. This cannot fail")), '\t']).collect::<String>());
+        //println!("{}", bool_digit(expr.eval(&state).unwrap()));
+        println!("{sub} = {res}", sub = expr.to_string().chars().map(|c| state.get(&c).map(|&b| bool_digit(b)).unwrap_or(c)).collect::<String>(), res = bool_digit(expr.eval(&state).unwrap()));
+    });
+}
+
+
+fn tokenize(input: &str) -> Result<Vec<Token>, TokenizingError> {
+    use Token::*;
+    input.chars().enumerate().map(|(index, c)| match c {
+        '1' | '0' => Ok(Some(Const(c == '1'))),
+        '!' => Ok(Some(Bang)),
+        '+' => Ok(Some(Plus)),
+        '*' => Ok(Some(Star)),
+        '^' => Ok(Some(Caret)),
+        '(' => Ok(Some(LParen)),
+        ')' => Ok(Some(RParen)),
+        v if v.is_alphabetic() => Ok(Some(Var(v.to_ascii_uppercase()))),
+        ws if ws.is_whitespace() => Ok(None),
+        _ => Err(UnexpectedChar(c, index))
+    }).collect::<Result<Vec<_>, TokenizingError>>().map(|v| v.into_iter().flatten().collect())
+}
+
+fn moving_union<T: Hash + Eq>(a: HashSet<T>, b: HashSet<T>) -> HashSet<T, RandomState> {
+    let mut s = HashSet::new();
+    s.extend(a.into_iter());
+    s.extend(b.into_iter());
+    s
+}
+
+fn bool_digit(b: bool) -> char {
+    if b { '1' } else { '0' }
+}
+
 
 #[derive(Debug)]
 enum ParseError {
@@ -25,40 +89,57 @@ impl Display for ParseError {
 
 impl Error for ParseError {}
 
-fn main() -> anyhow::Result<()> {
-    println!("Enter expression");
-    let line = read_line()?;
-    let tokens = tokenize(&line)?;
-    let mut parser = Parser::new(tokens.into_iter());
-    let expr = parser.expr()?;
-    println!("FN = {}", expr);
-    print_truth_table(&expr);
-    println!();
-    Ok(())
+
+#[derive(Debug)]
+enum TokenizingError {
+    UnexpectedChar(char, usize)
 }
 
-// 00 01 10 11
-fn print_truth_table(expr: &Op) {
-    let vars_names = {
-        let mut v = expr.variables().into_iter().collect::<Vec<_>>();
-        v.sort();
-        v
-    };
-    let vars_count = vars_names.len();
-    println!("{}FN", vars_names.iter().flat_map(|&c| [c, '\t']).collect::<String>());
-    for i in 0..2usize.pow(vars_count as u32) {
-        let binary = format!("{i:0>n$b}", n = vars_count);
-        let vars = HashMap::from_iter(vars_names.iter().zip(binary.chars()).map(|(&var, val)| (var, val == '1')));
-        print!("{}", vars_names.iter().flat_map(|c| [bool_digit(*vars.get(c).unwrap_or(&false)), '\t']).collect::<String>());
-        println!("{}", bool_digit(expr.eval(&vars).unwrap()));
+impl Display for TokenizingError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UnexpectedChar(char, index) => f.write_fmt(format_args!("Unexpected character `{char}` at index {index}"))
+        }
     }
 }
 
-fn read_line() -> anyhow::Result<String> {
-    let mut buf = String::new();
-    let _ = stdin().read_line(&mut buf)?;
-    Ok(buf.trim_end_matches(|c| c == '\n').to_string())
+impl Error for TokenizingError {}
+
+struct Vars {
+    names: Vec<char>,
+    current_pos: usize,
 }
+
+impl Vars {
+    fn new(names: Vec<char>) -> Self {
+        Self {
+            names,
+            current_pos: 0,
+        }
+    }
+
+    fn names(&self) -> &Vec<char> {
+        &self.names
+    }
+}
+
+impl Iterator for Vars {
+    type Item = HashMap<char, bool>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current_pos >= 2usize.pow(self.names.len() as u32) {
+            None
+        } else {
+            let bin = format!("{pos:0>n$b}", pos = self.current_pos, n = self.names.len());
+            let res = HashMap::from_iter(
+                self.names.iter().zip(bin.chars()).map(|(&name, val)| (name, val == '1'))
+            );
+            self.current_pos += 1;
+            Some(res)
+        }
+    }
+}
+
 
 struct Parser<I: Iterator<Item=Token>> {
     tokens: Peekable<I>,
@@ -189,13 +270,6 @@ impl Op {
     }
 }
 
-fn moving_union<T: Hash + Eq>(a: HashSet<T>, b: HashSet<T>) -> HashSet<T, RandomState> {
-    let mut s = HashSet::new();
-    s.extend(a.into_iter());
-    s.extend(b.into_iter());
-    s
-}
-
 impl Display for Op {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -213,43 +287,4 @@ impl Display for Op {
             Op::Xor(lhs, rhs) => f.write_fmt(format_args!("({lhs} ^ {rhs})")),
         }
     }
-}
-
-#[derive(Debug)]
-enum TokenizingError {
-    UnexpectedChar(char, usize)
-}
-
-impl Display for TokenizingError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TokenizingError::UnexpectedChar(char, index) => f.write_fmt(format_args!("Unexpected character `{char}` at index {index}"))
-        }
-    }
-}
-
-impl Error for TokenizingError {}
-
-fn tokenize(input: &str) -> Result<Vec<Token>, TokenizingError> {
-    use Token::*;
-    input.chars().enumerate().map(|(index, c)| match c {
-        '1' | '0' => Ok(Some(Const(c == '1'))),
-        '!' => Ok(Some(Bang)),
-        '+' => Ok(Some(Plus)),
-        '*' => Ok(Some(Star)),
-        '^' => Ok(Some(Caret)),
-        '(' => Ok(Some(LParen)),
-        ')' => Ok(Some(RParen)),
-        v if v.is_alphabetic() => Ok(Some(Var(v.to_ascii_uppercase()))),
-        ws if ws.is_whitespace() => Ok(None),
-        _ => Err(UnexpectedChar(c, index))
-    })
-        .collect::<Result<Vec<_>, TokenizingError>>()
-        .map(|v| v.into_iter().filter_map(|t| t).collect())
-}
-
-const MACRON: char = '\u{0304}';
-
-fn bool_digit(b: bool) -> char {
-    if b { '1' } else { '0' }
 }
