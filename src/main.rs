@@ -7,7 +7,10 @@ use std::io::stdin;
 use std::iter::Peekable;
 use std::ops::Not;
 
+#[allow(unused_imports)]
+use inline_colorization::color_reset;
 use itertools::Itertools;
+use rand::{Rng, thread_rng};
 
 use crate::ParseError::{ExpectedCloseParent, ExpectedExpr, ReachedEOF, UnexpectedToken};
 use crate::TokenizingError::UnexpectedChar;
@@ -35,15 +38,42 @@ fn read_line() -> anyhow::Result<String> {
 
 fn print_truth_table(expr: &Op) {
     let vars = Vars::new(expr.variables().into_iter().sorted().collect());
-    println!("{}FN", vars.names().iter().flat_map(|&c| [c, '\t']).collect::<String>());
+    let colors = generate_colors(vars.names());
+    println!("{}FN", vars.names().iter().flat_map(|c| [colorize(*c, colors.get(c).unwrap()), "\t".to_string()]).collect::<String>());
     vars.for_each(|state| {
-        //dbg!(&state);
         print!("{}", state.keys().sorted().flat_map(|b| [bool_digit(*state.get(b).expect("The key is gotten from this map. This cannot fail")), '\t']).collect::<String>());
-        //println!("{}", bool_digit(expr.eval(&state).unwrap()));
-        println!("{sub} = {res}", sub = expr.to_string().chars().map(|c| state.get(&c).map(|&b| bool_digit(b)).unwrap_or(c)).collect::<String>(), res = bool_digit(expr.eval(&state).unwrap()));
+        let colorized_substituted_expr = expr.to_string().chars().map(|c| {
+            if let Some(&bool) = state.get(&c) {
+                if let Some(color) = colors.get(&c) {
+                    colorize(bool_digit(bool), color)
+                } else {
+                    bool_digit(bool).to_string()
+                }
+            } else {
+                c.to_string()
+            }
+        }).collect::<String>();
+        println!("{sub} = {res}",
+                 sub = colorized_substituted_expr,
+                 res = bool_digit(expr.eval(&state).unwrap()));
     });
 }
 
+fn colorize<T>(t: T, color: Color) -> String where T: Display {
+    format!("{color}{t}{color_reset}")
+}
+
+type Color = &'static str;
+
+const COLORS: [Color; 14] = {
+    use inline_colorization::*;
+    [color_black, color_blue, color_cyan, color_green, color_magenta, color_red, color_yellow,
+        color_bright_black, color_bright_blue, color_bright_cyan, color_bright_green, color_bright_magenta, color_bright_red, color_bright_yellow]
+};
+
+fn generate_colors(names: &[char]) -> HashMap<char, Color> {
+    names.iter().copied().map(|c| (c, COLORS[thread_rng().gen_range(0..14)])).collect()
+}
 
 fn tokenize(input: &str) -> Result<Vec<Token>, TokenizingError> {
     use Token::*;
