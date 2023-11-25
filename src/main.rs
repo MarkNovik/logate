@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter, Write};
 use std::hash::Hash;
-use std::io::stdin;
+use std::io::{IsTerminal, stdin, stdout};
 use std::iter::Peekable;
 use std::ops::Not;
 
@@ -12,18 +12,23 @@ use itertools::Itertools;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 
-use crate::ParseError::{ExpectedCloseParent, ExpectedExpr, ReachedEOF, UnexpectedToken};
+use crate::ParseError::{ExpectedCloseParent, ReachedEOF, UnexpectedToken, UnparsedToken};
 use crate::TokenizingError::UnexpectedChar;
 
+macro_rules! negate {
+    ($lhs:ident) => {
+        $lhs = Op::Not(Box::new($lhs))
+    }
+}
+
 fn main() -> anyhow::Result<()> {
-    println!("Enter expression");
+    eprintln!("Enter expression");
     let line = read_line()?;
     let tokens = tokenize(&line)?;
     let mut parser = Parser::new(tokens.into_iter());
     let expr = parser.expr()?;
-    println!("FN = {}", expr);
+    eprintln!("FN = {}", expr);
     print_truth_table(&expr);
-    println!();
     Ok(())
 }
 
@@ -58,7 +63,11 @@ fn print_truth_table(expr: &Op) {
 }
 
 fn colorize<T>(t: T, color: Color) -> String where T: Display {
-    format!("{color}{t}{color_reset}")
+    if stdout().is_terminal() {
+        format!("{color}{t}{color_reset}")
+    } else {
+        t.to_string()
+    }
 }
 
 type Color = &'static str;
@@ -75,20 +84,42 @@ fn generate_colors(names: &[char]) -> HashMap<char, Color> {
     names.iter().copied().zip(c.iter().copied().take(names.len())).collect()
 }
 
+
 fn tokenize(input: &str) -> Result<Vec<Token>, TokenizingError> {
     use Token::*;
-    input.chars().enumerate().map(|(index, c)| match c {
-        '1' | '0' => Ok(Some(Const(c == '1'))),
-        '!' => Ok(Some(Bang)),
-        '+' => Ok(Some(Plus)),
-        '*' => Ok(Some(Star)),
-        '^' => Ok(Some(Caret)),
-        '(' => Ok(Some(LParen)),
-        ')' => Ok(Some(RParen)),
-        v if v.is_alphabetic() => Ok(Some(Var(v.to_ascii_uppercase()))),
-        ws if ws.is_whitespace() => Ok(None),
-        _ => Err(UnexpectedChar(c, index))
-    }).collect::<Result<Vec<_>, TokenizingError>>().map(|v| v.into_iter().flatten().collect())
+    let mut chars = input.chars().enumerate().peekable();
+    let mut tokens = Vec::new();
+    while let Some((index, ch)) = chars.next() {
+        tokens.push(match ch {
+            '1' | '0' => Const(ch == '1'),
+            '+' => Plus,
+            '*' => Star,
+            '^' => Caret,
+            '(' => LParen,
+            ')' => RParen,
+            '!' => {
+                match chars.peek().map(|(_, c)| *c) {
+                    Some('+') => {
+                        chars.next();
+                        BPlus
+                    }
+                    Some('*') => {
+                        chars.next();
+                        BStar
+                    }
+                    Some('^') => {
+                        chars.next();
+                        BCaret
+                    }
+                    _ => Bang,
+                }
+            }
+            v if v.is_alphabetic() => Var(v.to_ascii_uppercase()),
+            ws if ws.is_whitespace() => continue,
+            _ => return Err(UnexpectedChar(ch, index)),
+        });
+    }
+    Ok(tokens)
 }
 
 fn combine_sort_unique<T: Ord + Clone + Hash>(a: Vec<T>, b: Vec<T>) -> Vec<T> {
@@ -108,7 +139,7 @@ enum ParseError {
     ReachedEOF,
     ExpectedCloseParent,
     UnexpectedToken(Token),
-    ExpectedExpr,
+    UnparsedToken(Token),
 }
 
 impl Display for ParseError {
@@ -182,8 +213,13 @@ impl<I: Iterator<Item=Token>> Parser<I> {
         }
     }
 
-    fn expr(&mut self) -> Result<Op, ParseError> {
-        self.or()
+    pub fn expr(&mut self) -> Result<Op, ParseError> {
+        let expr = self.or();
+        if let Some(tok) = self.tokens.peek() {
+            Err(UnparsedToken(*tok))
+        } else {
+            expr
+        }
     }
 
     fn term(&mut self) -> Result<Op, ParseError> {
@@ -192,7 +228,7 @@ impl<I: Iterator<Item=Token>> Parser<I> {
             Const(b) => Ok(Op::Const(b)),
             Var(c) => Ok(Op::Var(c)),
             LParen => {
-                let expr = self.expr();
+                let expr = self.or();
                 self.tokens.next_if(|t| matches!(t, Token::RParen)).ok_or(ExpectedCloseParent).and(expr)
             }
             t => Err(UnexpectedToken(t))
@@ -202,7 +238,7 @@ impl<I: Iterator<Item=Token>> Parser<I> {
     fn or(&mut self) -> Result<Op, ParseError> {
         use Op::*;
         let mut lhs = self.and()?;
-        while self.tokens.next_if(|t| matches!(t, Token::Plus)).is_some() {
+        while let Some(tok) = self.tokens.next_if(|t| matches!(t, Token::Plus | Token::BPlus)) {
             let rhs = self.and()?;
             lhs = match (lhs, rhs) {
                 (Var(v1), Var(v2)) if v1 == v2 => Var(v1),
@@ -210,6 +246,9 @@ impl<I: Iterator<Item=Token>> Parser<I> {
                 (Const(false), op) | (op, Const(false)) => op,
                 (lhs, rhs) => Or(Box::new(lhs), Box::new(rhs))
             };
+            if tok == Token::BPlus {
+                negate!(lhs);
+            }
         }
         Ok(lhs)
     }
@@ -217,7 +256,7 @@ impl<I: Iterator<Item=Token>> Parser<I> {
     fn and(&mut self) -> Result<Op, ParseError> {
         use Op::*;
         let mut lhs = self.xor()?;
-        while self.tokens.next_if(|t| matches!(t, Token::Star)).is_some() {
+        while let Some(tok) = self.tokens.next_if(|t| matches!(t, Token::Star | Token::BStar)) {
             let rhs = self.xor()?;
             lhs = match (lhs, rhs) {
                 (Var(v1), Var(v2)) if v1 == v2 => Var(v1),
@@ -225,6 +264,9 @@ impl<I: Iterator<Item=Token>> Parser<I> {
                 (Const(false), _) | (_, Const(false)) => Const(false),
                 (lhs, rhs) => And(Box::new(lhs), Box::new(rhs)),
             };
+            if tok == Token::BStar {
+                negate!(lhs);
+            }
         }
         Ok(lhs)
     }
@@ -232,19 +274,22 @@ impl<I: Iterator<Item=Token>> Parser<I> {
     fn xor(&mut self) -> Result<Op, ParseError> {
         use Op::*;
         let mut lhs = self.not()?;
-        while self.tokens.next_if(|t| matches!(t, Token::Caret)).is_some() {
+        while let Some(tok) = self.tokens.next_if(|t| matches!(t, Token::Caret | Token::BCaret)) {
             let rhs = self.not()?;
             lhs = match (lhs, rhs) {
                 (Var(v1), Var(v2)) if v1 == v2 => Const(false),
                 (lhs, rhs) => Xor(Box::new(lhs), Box::new(rhs))
             };
+            if tok == Token::BCaret {
+                negate!(lhs);
+            }
         }
         Ok(lhs)
     }
 
     fn not(&mut self) -> Result<Op, ParseError> {
         if self.tokens.next_if(|t| matches!(t, Token::Bang)).is_some() {
-            let expr = self.not().map_err(|_| ExpectedExpr)?;
+            let expr = self.not()?;
             match expr {
                 Op::Const(b) => Ok(Op::Const(!b)),
                 Op::Not(op) => Ok(*op),
@@ -260,12 +305,15 @@ impl<I: Iterator<Item=Token>> Parser<I> {
 enum Token {
     Bang,
     Plus,
+    BPlus,
     Star,
-    Var(char),
+    BStar,
+    Caret,
+    BCaret,
     LParen,
     RParen,
     Const(bool),
-    Caret,
+    Var(char),
 }
 
 #[derive(Debug, Eq, PartialEq, Clone)]
