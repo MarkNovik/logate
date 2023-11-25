@@ -1,5 +1,4 @@
-use std::collections::{HashMap, HashSet};
-use std::collections::hash_map::RandomState;
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter, Write};
 use std::hash::Hash;
@@ -10,12 +9,11 @@ use std::ops::Not;
 #[allow(unused_imports)]
 use inline_colorization::color_reset;
 use itertools::Itertools;
-use rand::{Rng, thread_rng};
+use rand::seq::SliceRandom;
+use rand::thread_rng;
 
 use crate::ParseError::{ExpectedCloseParent, ExpectedExpr, ReachedEOF, UnexpectedToken};
 use crate::TokenizingError::UnexpectedChar;
-
-const MACRON: char = '\u{0304}';
 
 fn main() -> anyhow::Result<()> {
     println!("Enter expression");
@@ -65,14 +63,16 @@ fn colorize<T>(t: T, color: Color) -> String where T: Display {
 
 type Color = &'static str;
 
-const COLORS: [Color; 14] = {
+const COLORS: [Color; 12] = {
     use inline_colorization::*;
-    [color_black, color_blue, color_cyan, color_green, color_magenta, color_red, color_yellow,
-        color_bright_black, color_bright_blue, color_bright_cyan, color_bright_green, color_bright_magenta, color_bright_red, color_bright_yellow]
+    [color_blue, color_cyan, color_green, color_magenta, color_red, color_yellow,
+        color_bright_blue, color_bright_cyan, color_bright_green, color_bright_magenta, color_bright_red, color_bright_yellow]
 };
 
 fn generate_colors(names: &[char]) -> HashMap<char, Color> {
-    names.iter().copied().map(|c| (c, COLORS[thread_rng().gen_range(0..14)])).collect()
+    let mut c = COLORS;
+    c.shuffle(&mut thread_rng());
+    names.iter().copied().zip(c.iter().copied().take(names.len())).collect()
 }
 
 fn tokenize(input: &str) -> Result<Vec<Token>, TokenizingError> {
@@ -91,11 +91,11 @@ fn tokenize(input: &str) -> Result<Vec<Token>, TokenizingError> {
     }).collect::<Result<Vec<_>, TokenizingError>>().map(|v| v.into_iter().flatten().collect())
 }
 
-fn moving_union<T: Hash + Eq>(a: HashSet<T>, b: HashSet<T>) -> HashSet<T, RandomState> {
-    let mut s = HashSet::new();
-    s.extend(a.into_iter());
-    s.extend(b.into_iter());
-    s
+fn combine_sort_unique<T: Ord + Clone + Hash>(a: Vec<T>, b: Vec<T>) -> Vec<T> {
+    let mut res = Vec::new();
+    res.extend(a);
+    res.extend(b);
+    res.into_iter().unique().sorted().collect()
 }
 
 fn bool_digit(b: bool) -> char {
@@ -279,12 +279,15 @@ enum Op {
 }
 
 impl Op {
-    fn variables(&self) -> HashSet<char> {
+    /// returns a list of variables, sorted in alphabetical order
+    fn variables(&self) -> Vec<char> {
         match self {
-            Op::Const(_) => HashSet::new(),
-            Op::Var(name) => HashSet::from([*name]),
+            Op::Const(_) => Vec::new(),
+            Op::Var(name) => vec![*name],
             Op::Not(op) => op.variables(),
-            Op::Or(a, b) | Op::And(a, b) | Op::Xor(a, b) => moving_union(a.variables(), b.variables())
+            Op::Or(a, b) |
+            Op::And(a, b) |
+            Op::Xor(a, b) => combine_sort_unique(a.variables(), b.variables())
         }
     }
 
@@ -305,13 +308,7 @@ impl Display for Op {
         match self {
             Op::Const(b) => f.write_char(bool_digit(*b)),
             Op::Var(name) => f.write_fmt(format_args!("{name}")),
-            Op::Not(op) => {
-                if let Op::Var(name) = **op {
-                    f.write_fmt(format_args!("{name}{MACRON}"))
-                } else {
-                    f.write_fmt(format_args!("!{op}"))
-                }
-            }
+            Op::Not(op) => f.write_fmt(format_args!("!{op}")),
             Op::Or(lhs, rhs) => f.write_fmt(format_args!("({lhs} + {rhs})")),
             Op::And(lhs, rhs) => f.write_fmt(format_args!("({lhs} * {rhs})")),
             Op::Xor(lhs, rhs) => f.write_fmt(format_args!("({lhs} ^ {rhs})")),
