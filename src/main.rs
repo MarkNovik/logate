@@ -228,7 +228,7 @@ impl<I: Iterator<Item=Token>> Parser<I> {
             Const(b) => Ok(Op::Const(b)),
             Var(c) => Ok(Op::Var(c)),
             LParen => {
-                let expr = self.or();
+                let expr = self.or().map(|o| o.enclose(true));
                 self.tokens.next_if(|t| matches!(t, Token::RParen)).ok_or(ExpectedCloseParent).and(expr)
             }
             t => Err(UnexpectedToken(t))
@@ -244,7 +244,7 @@ impl<I: Iterator<Item=Token>> Parser<I> {
                 (Var(v1), Var(v2)) if v1 == v2 => Var(v1),
                 (Const(true), _) | (_, Const(true)) => Const(true),
                 (Const(false), op) | (op, Const(false)) => op,
-                (lhs, rhs) => Or(Box::new(lhs), Box::new(rhs))
+                (lhs, rhs) => Or { lhs: Box::new(lhs), rhs: Box::new(rhs), enclose: false },
             };
             if tok == Token::BPlus {
                 negate!(lhs);
@@ -262,7 +262,7 @@ impl<I: Iterator<Item=Token>> Parser<I> {
                 (Var(v1), Var(v2)) if v1 == v2 => Var(v1),
                 (Const(true), op) | (op, Const(true)) => op,
                 (Const(false), _) | (_, Const(false)) => Const(false),
-                (lhs, rhs) => And(Box::new(lhs), Box::new(rhs)),
+                (lhs, rhs) => And { lhs: Box::new(lhs), rhs: Box::new(rhs), enclose: false },
             };
             if tok == Token::BStar {
                 negate!(lhs);
@@ -278,7 +278,7 @@ impl<I: Iterator<Item=Token>> Parser<I> {
             let rhs = self.not()?;
             lhs = match (lhs, rhs) {
                 (Var(v1), Var(v2)) if v1 == v2 => Const(false),
-                (lhs, rhs) => Xor(Box::new(lhs), Box::new(rhs))
+                (lhs, rhs) => Xor { lhs: Box::new(lhs), rhs: Box::new(rhs), enclose: false },
             };
             if tok == Token::BCaret {
                 negate!(lhs);
@@ -293,6 +293,7 @@ impl<I: Iterator<Item=Token>> Parser<I> {
             match expr {
                 Op::Const(b) => Ok(Op::Const(!b)),
                 Op::Not(op) => Ok(*op),
+                Op::Or { .. } | Op::And { .. } | Op::Xor { .. } => Ok(Op::Not(Box::new(expr.enclose(false)))),
                 _ => Ok(Op::Not(Box::new(expr)))
             }
         } else {
@@ -321,9 +322,9 @@ enum Op {
     Const(bool),
     Var(char),
     Not(Box<Op>),
-    Or(Box<Op>, Box<Op>),
-    Xor(Box<Op>, Box<Op>),
-    And(Box<Op>, Box<Op>),
+    Or { lhs: Box<Op>, rhs: Box<Op>, enclose: bool },
+    Xor { lhs: Box<Op>, rhs: Box<Op>, enclose: bool },
+    And { lhs: Box<Op>, rhs: Box<Op>, enclose: bool },
 }
 
 impl Op {
@@ -333,9 +334,9 @@ impl Op {
             Op::Const(_) => Vec::new(),
             Op::Var(name) => vec![*name],
             Op::Not(op) => op.variables(),
-            Op::Or(a, b) |
-            Op::And(a, b) |
-            Op::Xor(a, b) => combine_sort_unique(a.variables(), b.variables())
+            Op::Or { lhs, rhs, .. } |
+            Op::And { lhs, rhs, .. } |
+            Op::Xor { lhs, rhs, .. } => combine_sort_unique(lhs.variables(), rhs.variables())
         }
     }
 
@@ -344,22 +345,48 @@ impl Op {
             Op::Const(b) => Some(*b),
             Op::Var(c) => vars.get(c).copied(),
             Op::Not(op) => op.eval(vars).map(bool::not),
-            Op::Or(a, b) => Some((a.eval(vars)?) || (b.eval(vars)?)),
-            Op::And(a, b) => Some((a.eval(vars)?) && (b.eval(vars)?)),
-            Op::Xor(a, b) => Some((a.eval(vars)?) ^ (b.eval(vars)?)),
+            Op::Or { lhs, rhs, .. } => Some((lhs.eval(vars)?) || (rhs.eval(vars)?)),
+            Op::And { lhs, rhs, .. } => Some((lhs.eval(vars)?) && (rhs.eval(vars)?)),
+            Op::Xor { lhs, rhs, .. } => Some((lhs.eval(vars)?) ^ (rhs.eval(vars)?)),
+        }
+    }
+
+    fn enclose(self, enclose: bool) -> Self {
+        match self {
+            Op::Or { lhs, rhs, .. } => Op::Or { lhs, rhs, enclose },
+            Op::Xor { lhs, rhs, .. } => Op::Xor { lhs, rhs, enclose },
+            Op::And { lhs, rhs, .. } => Op::And { lhs, rhs, enclose },
+            Op::Not(op) => Op::Not(Box::new(op.enclose(enclose))),
+            _ => self,
         }
     }
 }
 
 impl Display for Op {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        macro_rules! enclose {
+            ($e:expr, $l:literal) => {{
+                let mut res = String::new();
+                if $e { res.push('('); }
+                res.push_str(&format!($l));
+                if $e { res.push(')'); }
+                res
+            }};
+        }
         match self {
             Op::Const(b) => f.write_char(bool_digit(*b)),
             Op::Var(name) => f.write_fmt(format_args!("{name}")),
-            Op::Not(op) => f.write_fmt(format_args!("!{op}")),
-            Op::Or(lhs, rhs) => f.write_fmt(format_args!("({lhs} + {rhs})")),
-            Op::And(lhs, rhs) => f.write_fmt(format_args!("({lhs} * {rhs})")),
-            Op::Xor(lhs, rhs) => f.write_fmt(format_args!("({lhs} ^ {rhs})")),
+            Op::Not(op) => {
+                match *op.to_owned() {
+                    Op::Or { lhs, rhs, enclose } => f.write_str(&enclose!(enclose, "{lhs} !+ {rhs}")),
+                    Op::Xor { lhs, rhs, enclose } => f.write_str(&enclose!(enclose, "{lhs} !* {rhs}")),
+                    Op::And { lhs, rhs, enclose } => f.write_str(&enclose!(enclose, "{lhs} !^ {rhs}")),
+                    _ => f.write_fmt(format_args!("!{op}"))
+                }
+            }
+            Op::Or { lhs, rhs, enclose } => f.write_str(&enclose!(*enclose, "{lhs} + {rhs}")),
+            Op::And { lhs, rhs, enclose } => f.write_str(&enclose!(*enclose, "{lhs} * {rhs}")),
+            Op::Xor { lhs, rhs, enclose } => f.write_str(&enclose!(*enclose, "{lhs} ^ {rhs}")),
         }
     }
 }
