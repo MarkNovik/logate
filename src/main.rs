@@ -1,27 +1,11 @@
 use std::collections::HashMap;
-use std::error::Error;
-use std::fmt::{Display, Formatter, Write};
-use std::hash::Hash;
-use std::io::{stdin, stdout, IsTerminal};
-use std::iter::Peekable;
-use std::ops::Not;
-use itertools::Itertools;
-
-use crate::ParseError::{ExpectedCloseParent, ReachedEOF, UnexpectedToken, UnparsedToken};
-use crate::TokenizingError::UnexpectedChar;
-
-macro_rules! negate {
-    ($lhs:ident) => {
-        $lhs = Op::Not(Box::new($lhs))
-    };
-}
 
 fn main() -> anyhow::Result<()> {
     eprintln!("Enter expression");
     let line = read_line()?;
     let tokens = tokenize(&line)?;
     let mut parser = Parser::new(tokens.into_iter());
-    let expr = parser.expr()?;
+    let expr = parser.expr()?.simplify();
     eprintln!("FN = {expr}");
     print_truth_table(&expr);
     Ok(())
@@ -29,12 +13,16 @@ fn main() -> anyhow::Result<()> {
 
 fn read_line() -> anyhow::Result<String> {
     let mut buf = String::new();
-    let _ = stdin().read_line(&mut buf)?;
+    let _ = std::io::stdin().read_line(&mut buf)?;
     Ok(buf.trim_end_matches('\n').to_string())
 }
 
 fn print_truth_table(expr: &Op) {
-    let vars = Vars::new(expr.variables().into_iter().sorted().collect());
+    let vars = {
+        let mut vars = expr.variables();
+        vars.sort();
+        Vars::new(vars)
+    };
     let colors = generate_colors(vars.names());
     println!(
         "{}FN",
@@ -44,11 +32,13 @@ fn print_truth_table(expr: &Op) {
             .collect::<String>()
     );
     vars.for_each(|state| {
+        let mut pairs = state.iter().collect::<Vec<_>>();
+        pairs.sort_by_key(|(k, _)| *k);
+
         print!(
             "{}",
-            state
-                .iter()
-                .sorted_by_key(|(k, _)| **k)
+            pairs
+                .into_iter()
                 .flat_map(|(_, v)| [bool_digit(*v), '\t'])
                 .collect::<String>()
         );
@@ -77,9 +67,11 @@ fn print_truth_table(expr: &Op) {
 
 fn colorize<T>(t: T, color: Color) -> String
 where
-    T: Display,
+    T: std::fmt::Display,
 {
     use inline_colorization::color_reset;
+    use std::io::{stdout, IsTerminal};
+
     if stdout().is_terminal() {
         format!("{color}{t}{color_reset}")
     } else {
@@ -122,35 +114,37 @@ fn tokenize(input: &str) -> Result<Vec<Token>, TokenizingError> {
     while let Some((index, ch)) = chars.next() {
         tokens.push(match ch {
             '1' | '0' => Token::Const(ch == '1'),
-            '+' => Token::Plus,
-            '*' => Token::Star,
-            '^' => Token::Caret,
+            '|' => Token::Or,
+            '&' => Token::And,
+            '^' => Token::Xor,
             '(' => Token::LParen,
             ')' => Token::RParen,
             '!' => {
                 match chars
-                    .next_if(|(_, c)| matches!(c, '+' | '*' | '^'))
+                    .next_if(|(_, c)| matches!(c, '^' | '|' | '&'))
                     .map(|(_, c)| c)
                 {
-                    Some('+') => Token::BPlus,
-                    Some('*') => Token::BStar,
-                    Some('^') => Token::BCaret,
+                    Some('|') => Token::Nor,
+                    Some('&') => Token::Nand,
+                    Some('^') => Token::Xnor,
                     _ => Token::Bang,
                 }
             }
             v if v.is_alphabetic() => Token::Var(v.to_ascii_uppercase()),
             ws if ws.is_whitespace() => continue,
-            _ => return Err(UnexpectedChar(ch, index)),
+            _ => return Err(TokenizingError::UnexpectedChar(ch, index)),
         });
     }
     Ok(tokens)
 }
 
-fn combine_sort_unique<T: Ord + Clone + Hash>(a: Vec<T>, b: Vec<T>) -> Vec<T> {
-    let mut res = Vec::new();
+fn combine_sort_unique<T: Ord + Clone + std::hash::Hash>(a: Vec<T>, b: Vec<T>) -> Vec<T> {
+    let mut res = std::collections::HashSet::new();
     res.extend(a);
     res.extend(b);
-    res.into_iter().unique().sorted().collect()
+    let mut res = Vec::from_iter(res);
+    res.sort();
+    res
 }
 
 fn bool_digit(b: bool) -> char {
@@ -169,30 +163,30 @@ enum ParseError {
     UnparsedToken,
 }
 
-impl Display for ParseError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_fmt(format_args!("{self:?}"))
     }
 }
 
-impl Error for ParseError {}
+impl std::error::Error for ParseError {}
 
 #[derive(Debug)]
 enum TokenizingError {
     UnexpectedChar(char, usize),
 }
 
-impl Display for TokenizingError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+impl std::fmt::Display for TokenizingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            UnexpectedChar(char, index) => f.write_fmt(format_args!(
+            TokenizingError::UnexpectedChar(char, index) => f.write_fmt(format_args!(
                 "Unexpected character `{char}` at index {index}"
             )),
         }
     }
 }
 
-impl Error for TokenizingError {}
+impl std::error::Error for TokenizingError {}
 
 struct Vars {
     names: Vec<char>,
@@ -233,7 +227,7 @@ impl Iterator for Vars {
 }
 
 struct Parser<I: Iterator<Item = Token>> {
-    tokens: Peekable<I>,
+    tokens: std::iter::Peekable<I>,
 }
 
 impl<I: Iterator<Item = Token>> Parser<I> {
@@ -246,19 +240,21 @@ impl<I: Iterator<Item = Token>> Parser<I> {
     pub fn expr(&mut self) -> Result<Op, ParseError> {
         let expr = self.or();
         if self.tokens.peek().is_some() {
-            Err(UnparsedToken)
+            Err(ParseError::UnparsedToken)
         } else {
             expr
         }
     }
 
     fn term(&mut self) -> Result<Op, ParseError> {
+        use ParseError::{ExpectedCloseParent, ReachedEOF, UnexpectedToken};
         use Token::{Const, LParen, RParen, Var};
+
         match self.tokens.next().ok_or(ReachedEOF)? {
             Const(b) => Ok(Op::Const(b)),
             Var(c) => Ok(Op::Var(c)),
             LParen => {
-                let expr = self.or().map(|o| o.enclose(true));
+                let expr = self.or().map(|o| o);
                 self.tokens
                     .next_if(|t| matches!(t, RParen))
                     .ok_or(ExpectedCloseParent)
@@ -269,70 +265,46 @@ impl<I: Iterator<Item = Token>> Parser<I> {
     }
 
     fn or(&mut self) -> Result<Op, ParseError> {
-        use Op::{Const, Or, Var};
         let mut lhs = self.and()?;
-        while let Some(tok) = self
-            .tokens
-            .next_if(|t| matches!(t, Token::Plus | Token::BPlus))
-        {
+        while let Some(tok) = self.tokens.next_if(|t| matches!(t, Token::Or | Token::Nor)) {
             let rhs = self.and()?;
-            lhs = match (lhs, rhs) {
-                (Var(v1), Var(v2)) if v1 == v2 => Var(v1),
-                (Const(true), _) | (_, Const(true)) => Const(true),
-                (Const(false), op) | (op, Const(false)) => op,
-                (lhs, rhs) => Or {
-                    lhs: Box::new(lhs),
-                    rhs: Box::new(rhs),
-                },
-            };
-            if tok == Token::BPlus {
-                negate!(lhs);
+
+            lhs = match tok {
+                Token::Or => Op::or(lhs, rhs),
+                Token::Nor => Op::not(Op::or(lhs, rhs)),
+                _ => unreachable!("Program enters here only if tok is Or or Nor"),
             }
         }
         Ok(lhs)
     }
 
     fn and(&mut self) -> Result<Op, ParseError> {
-        use Op::{And, Const, Var};
         let mut lhs = self.xor()?;
         while let Some(tok) = self
             .tokens
-            .next_if(|t| matches!(t, Token::Star | Token::BStar))
+            .next_if(|t| matches!(t, Token::And | Token::Nand))
         {
             let rhs = self.xor()?;
-            lhs = match (lhs, rhs) {
-                (Var(v1), Var(v2)) if v1 == v2 => Var(v1),
-                (Const(true), op) | (op, Const(true)) => op,
-                (Const(false), _) | (_, Const(false)) => Const(false),
-                (lhs, rhs) => And {
-                    lhs: Box::new(lhs),
-                    rhs: Box::new(rhs),
-                },
-            };
-            if tok == Token::BStar {
-                negate!(lhs);
+            lhs = match tok {
+                Token::And => Op::and(lhs, rhs),
+                Token::Nand => Op::not(Op::and(lhs, rhs)),
+                _ => unreachable!("Program enters here only if tok is And or Nand"),
             }
         }
         Ok(lhs)
     }
 
     fn xor(&mut self) -> Result<Op, ParseError> {
-        use Op::{Const, Var, Xor};
         let mut lhs = self.not()?;
         while let Some(tok) = self
             .tokens
-            .next_if(|t| matches!(t, Token::Caret | Token::BCaret))
+            .next_if(|t| matches!(t, Token::Xor | Token::Xnor))
         {
             let rhs = self.not()?;
-            lhs = match (lhs, rhs) {
-                (Var(v1), Var(v2)) if v1 == v2 => Const(false),
-                (lhs, rhs) => Xor {
-                    lhs: Box::new(lhs),
-                    rhs: Box::new(rhs),
-                },
-            };
-            if tok == Token::BCaret {
-                negate!(lhs);
+            lhs = match tok {
+                Token::Xor => Op::xor(lhs, rhs),
+                Token::Xnor => Op::not(Op::xor(lhs, rhs)),
+                _ => unreachable!("Program enters here only if tok is Xor or Xnor"),
             }
         }
         Ok(lhs)
@@ -340,15 +312,7 @@ impl<I: Iterator<Item = Token>> Parser<I> {
 
     fn not(&mut self) -> Result<Op, ParseError> {
         if self.tokens.next_if(|t| matches!(t, Token::Bang)).is_some() {
-            let expr = self.not()?;
-            match expr {
-                Op::Const(b) => Ok(Op::Const(!b)),
-                Op::Not(op) => Ok(*op),
-                Op::Or { .. } | Op::And { .. } | Op::Xor { .. } => {
-                    Ok(Op::Not(Box::new(expr.enclose(false))))
-                }
-                Op::Var(_) => Ok(Op::Not(Box::new(expr))),
-            }
+            self.not().map(Op::not)
         } else {
             self.term()
         }
@@ -358,12 +322,12 @@ impl<I: Iterator<Item = Token>> Parser<I> {
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 enum Token {
     Bang,
-    Plus,
-    BPlus,
-    Star,
-    BStar,
-    Caret,
-    BCaret,
+    Or,
+    Nor,
+    And,
+    Nand,
+    Xor,
+    Xnor,
     LParen,
     RParen,
     Const(bool),
@@ -375,58 +339,159 @@ enum Op {
     Const(bool),
     Var(char),
     Not(Box<Op>),
-    Or {
-        lhs: Box<Op>,
-        rhs: Box<Op>,
-    },
-    Xor {
-        lhs: Box<Op>,
-        rhs: Box<Op>,
-    },
-    And {
-        lhs: Box<Op>,
-        rhs: Box<Op>,
-    },
+    Or { lhs: Box<Op>, rhs: Box<Op> },
+    Xor { lhs: Box<Op>, rhs: Box<Op> },
+    And { lhs: Box<Op>, rhs: Box<Op> },
 }
 
 impl Op {
+    fn not(op: Op) -> Self {
+        Op::Not(Box::new(op))
+    }
+
+    fn or(lhs: Op, rhs: Op) -> Self {
+        Op::Or {
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        }
+    }
+
+    fn and(lhs: Op, rhs: Op) -> Self {
+        Op::And {
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        }
+    }
+
+    fn xor(lhs: Op, rhs: Op) -> Self {
+        Op::Xor {
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        }
+    }
+
     /// returns a list of variables, sorted in alphabetical order
     fn variables(&self) -> Vec<char> {
         match self {
             Op::Const(_) => Vec::new(),
             Op::Var(name) => vec![*name],
             Op::Not(op) => op.variables(),
-            Op::Or { lhs, rhs, .. } | Op::And { lhs, rhs, .. } | Op::Xor { lhs, rhs, .. } => {
+            Op::Or { lhs, rhs } | Op::And { lhs, rhs } | Op::Xor { lhs, rhs } => {
                 combine_sort_unique(lhs.variables(), rhs.variables())
             }
         }
     }
 
     fn eval(&self, vars: &HashMap<char, bool>) -> Option<bool> {
+        use std::ops::Not;
+
         match self {
             Op::Const(b) => Some(*b),
             Op::Var(c) => vars.get(c).copied(),
             Op::Not(op) => op.eval(vars).map(bool::not),
-            Op::Or { lhs, rhs, .. } => Some((lhs.eval(vars)?) || (rhs.eval(vars)?)),
-            Op::And { lhs, rhs, .. } => Some((lhs.eval(vars)?) && (rhs.eval(vars)?)),
-            Op::Xor { lhs, rhs, .. } => Some((lhs.eval(vars)?) ^ (rhs.eval(vars)?)),
+            Op::Or { lhs, rhs } => Some((lhs.eval(vars)?) || (rhs.eval(vars)?)),
+            Op::And { lhs, rhs } => Some((lhs.eval(vars)?) && (rhs.eval(vars)?)),
+            Op::Xor { lhs, rhs } => Some((lhs.eval(vars)?) ^ (rhs.eval(vars)?)),
         }
     }
 
-    fn enclose(self, _enclose: bool) -> Self {
-        let enclose = true;
+    fn simplify(self) -> Self {
         match self {
-            Op::Or { lhs, rhs, .. } => Op::Or { lhs, rhs },
-            Op::Xor { lhs, rhs, .. } => Op::Xor { lhs, rhs },
-            Op::And { lhs, rhs, .. } => Op::And { lhs, rhs },
-            Op::Not(op) => Op::Not(Box::new(op.enclose(enclose))),
-            _ => self,
+            Op::Const(_) => self,
+            Op::Var(_) => self,
+            Op::Not(op) => {
+                let op = op.simplify();
+                match op {
+                    Op::Const(b) => Op::Const(!b),
+                    Op::Not(op) => *op,
+                    Op::Or { lhs, rhs } => {
+                        Op::and(Op::not(*lhs).simplify(), Op::not(*rhs).simplify())
+                    }
+                    Op::And { lhs, rhs } => {
+                        Op::or(Op::not(*lhs).simplify(), Op::not(*rhs).simplify())
+                    }
+                    op @ (Op::Var(_) | Op::Xor { .. }) => Op::Not(Box::new(op)),
+                }
+            }
+            Op::Or { lhs, rhs } => {
+                let lhs = lhs.simplify();
+                let rhs = rhs.simplify();
+                if matches!(lhs, Op::Const(false)) {
+                    rhs
+                } else if matches!(rhs, Op::Const(false)) {
+                    lhs
+                } else if matches!(rhs, Op::Const(true)) || matches!(lhs, Op::Const(true)) {
+                    Op::Const(true)
+                } else if lhs == rhs {
+                    lhs
+                }
+                // A | !A => 1, !A | A => 1
+                else if matches!((&lhs, &rhs), (Op::Var(a), Op::Not(op)) | (Op::Not(op), Op::Var(a)) if matches!(op.as_ref(), Op::Var(b) if a == b))
+                {
+                    Op::Const(true)
+                } else {
+                    Op::Or {
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                    }
+                }
+            }
+            Op::Xor { lhs, rhs } => {
+                let lhs = lhs.simplify();
+                let rhs = rhs.simplify();
+                if lhs == rhs {
+                    Op::Const(false)
+                } else if matches!(lhs, Op::Const(false)) {
+                    rhs
+                } else if matches!(rhs, Op::Const(false)) {
+                    lhs
+                } else if matches!(lhs, Op::Const(true)) {
+                    Op::not(rhs).simplify()
+                } else if matches!(rhs, Op::Const(true)) {
+                    Op::not(lhs).simplify()
+                }
+                // a ^ !a, !a ^a => 1
+                else if matches!((&lhs, &rhs), (Op::Var(a), Op::Not(op)) | (Op::Not(op), Op::Var(a)) if matches!(op.as_ref(), Op::Var(b) if a == b))
+                {
+                    Op::Const(true)
+                } else {
+                    Op::Xor {
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                    }
+                }
+            }
+            Op::And { lhs, rhs } => {
+                let lhs = lhs.simplify();
+                let rhs = rhs.simplify();
+                if matches!(lhs, Op::Const(true)) {
+                    rhs
+                } else if matches!(rhs, Op::Const(true)) {
+                    lhs
+                } else if matches!(rhs, Op::Const(false)) || matches!(lhs, Op::Const(false)) {
+                    Op::Const(false)
+                } else if lhs == rhs {
+                    lhs
+                }
+                // A & !A => 0, !A & A => 0
+                else if matches!((&lhs, &rhs), (Op::Var(a), Op::Not(op)) | (Op::Not(op), Op::Var(a)) if matches!(op.as_ref(), Op::Var(b) if a == b))
+                {
+                    Op::Const(false)
+                } else {
+                    Op::And {
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                    }
+                }
+            }
         }
     }
 }
 
-impl Display for Op {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+impl std::fmt::Display for Op {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use std::fmt::Write;
+
         match self {
             Op::Const(b) => f.write_char(bool_digit(*b)),
             Op::Var(name) => f.write_fmt(format_args!("{name}")),
