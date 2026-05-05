@@ -1,20 +1,44 @@
 use std::collections::HashMap;
 
+fn exename() -> String {
+    // SAFETY: First argument of args is executable name and is always present.
+    unsafe { std::env::args().next().unwrap_unchecked() }
+}
+
+fn prin_usage() {
+    println!("Usage: {} <-h|line>", exename());
+    println!("Args:");
+    println!("\t-h   - print this message.");
+    println!("\tline - parse the argument as logic expression and print the truth table.");
+}
+
 fn main() -> anyhow::Result<()> {
-    eprintln!("Enter expression");
-    let line = read_line()?;
+    use std::process::exit;
+
+    let mut args = std::env::args().skip(1);
+    let line = {
+        match args.next() {
+            Some(h) if h.as_str() == "-h" => {
+                prin_usage();
+                exit(0)
+            }
+            Some(l) => l,
+            None => {
+                prin_usage();
+                eprintln!("ERR: No arguments provided");
+                exit(1)
+            }
+        }
+    };
+
     let tokens = tokenize(&line)?;
     let mut parser = Parser::new(tokens.into_iter());
     let expr = parser.expr()?.simplify();
     eprintln!("FN = {expr}");
-    print_truth_table(&expr);
+    if !matches!(expr, Op::Const(_)) {
+        print_truth_table(&expr);
+    }
     Ok(())
-}
-
-fn read_line() -> anyhow::Result<String> {
-    let mut buf = String::new();
-    let _ = std::io::stdin().read_line(&mut buf)?;
-    Ok(buf.trim_end_matches('\n').to_string())
 }
 
 fn print_truth_table(expr: &Op) {
@@ -495,14 +519,12 @@ impl std::fmt::Display for Op {
         match self {
             Op::Const(b) => f.write_char(bool_digit(*b)),
             Op::Var(name) => f.write_fmt(format_args!("{name}")),
-            Op::Not(op) => match *op.to_owned() {
-                Op::Or { lhs, rhs } => f.write_str(&format!("({lhs} !+ {rhs})")),
-                Op::Xor { lhs, rhs } => f.write_str(&format!("({lhs} !^ {rhs})")),
-                Op::And { lhs, rhs } => f.write_str(&format!("({lhs} !* {rhs})")),
-                _ => f.write_fmt(format_args!("!{op}")),
+            Op::Not(ref op) => match op.as_ref() {
+                Op::Var(v) => f.write_fmt(format_args!("~{v}")),
+                op => f.write_fmt(format_args!("~({op})")),
             },
-            Op::Or { lhs, rhs } => f.write_str(&format!("({lhs} + {rhs})")),
-            Op::And { lhs, rhs } => f.write_str(&format!("({lhs} * {rhs})")),
+            Op::Or { lhs, rhs } => f.write_str(&format!("({lhs} | {rhs})")),
+            Op::And { lhs, rhs } => f.write_str(&format!("({lhs} & {rhs})")),
             Op::Xor { lhs, rhs } => f.write_str(&format!("({lhs} ^ {rhs})")),
         }
     }
