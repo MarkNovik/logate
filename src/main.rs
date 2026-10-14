@@ -5,43 +5,57 @@ fn exename() -> String {
     unsafe { std::env::args().next().unwrap_unchecked() }
 }
 
-fn prin_usage() {
+fn print_usage() {
     println!("Usage: {} <-h|line>", exename());
     println!("Args:");
     println!("\t-h   - print this message.");
     println!("\tline - parse the argument as logic expression and print the truth table.");
 }
 
+fn cond(a: bool, b: bool) -> bool {
+    (!a) || b
+}
+
+fn rev_cond(a: bool, b: bool) -> bool {
+    b && (!a)
+}
+
+fn bi_cond(a: bool, b: bool) -> bool {
+    !(a ^ b)
+}
+
 fn main() -> anyhow::Result<()> {
     use std::process::exit;
 
     let mut args = std::env::args().skip(1);
-    let line = {
+    let line = Box::leak(Box::new({
         match args.next() {
             Some(h) if h.as_str() == "-h" => {
-                prin_usage();
+                print_usage();
                 exit(0)
             }
             Some(l) => l,
             None => {
-                prin_usage();
+                print_usage();
                 eprintln!("ERR: No arguments provided");
                 exit(1)
             }
         }
-    };
+    }));
 
-    let tokens = tokenize(&line)?;
-    let mut parser = Parser::new(tokens.into_iter());
+    let tokens = tokenize(line)?;
+    let mut parser = Parser::new(line, tokens.into_iter());
     let expr = parser.expr()?.simplify();
     eprintln!("FN = {expr}");
     if !matches!(expr, Op::Const(_)) {
-        print_truth_table(&expr);
+        print_truth_table(&expr, &expr.to_string());
     }
     Ok(())
 }
 
-fn print_truth_table(expr: &Op) {
+fn print_truth_table(expr: &Op, fn_name: &str) {
+    const CONNECTION_CHAR: char = '\t';
+
     let vars = {
         let mut vars = expr.variables();
         vars.sort();
@@ -49,10 +63,13 @@ fn print_truth_table(expr: &Op) {
     };
     let colors = generate_colors(vars.names());
     println!(
-        "{}FN",
+        "{}{fn_name}",
         vars.names()
             .iter()
-            .flat_map(|c| [colorize(*c, colors.get(c).unwrap()), "\t".to_string()])
+            .flat_map(|c| [
+                colorize(*c, colors.get(c).unwrap()),
+                CONNECTION_CHAR.to_string()
+            ])
             .collect::<String>()
     );
     vars.for_each(|state| {
@@ -63,7 +80,7 @@ fn print_truth_table(expr: &Op) {
             "{}",
             pairs
                 .into_iter()
-                .flat_map(|(_, v)| [bool_digit(*v), '\t'])
+                .flat_map(|(_, v)| [bool_digit(*v), CONNECTION_CHAR])
                 .collect::<String>()
         );
         let colorized_substituted_expr = expr
@@ -132,32 +149,56 @@ fn generate_colors(names: &[char]) -> HashMap<char, Color> {
         .collect()
 }
 
-fn tokenize(input: &str) -> Result<Vec<Token>, TokenizingError> {
+fn tokenize(input: &str) -> Result<Vec<Located<Token>>, TokenizingError<'_>> {
     let mut chars = input.chars().enumerate().peekable();
     let mut tokens = Vec::new();
     while let Some((index, ch)) = chars.next() {
-        tokens.push(match ch {
-            '1' | '0' => Token::Const(ch == '1'),
-            '|' => Token::Or,
-            '&' => Token::And,
-            '^' => Token::Xor,
-            '(' => Token::LParen,
-            ')' => Token::RParen,
-            '!' => {
-                match chars
-                    .next_if(|(_, c)| matches!(c, '^' | '|' | '&'))
-                    .map(|(_, c)| c)
-                {
-                    Some('|') => Token::Nor,
-                    Some('&') => Token::Nand,
-                    Some('^') => Token::Xnor,
-                    _ => Token::Bang,
+        tokens.push((
+            index,
+            match ch {
+                '1' | '0' => Token::Const(ch == '1'),
+                '|' => Token::Or,
+                '&' => Token::And,
+                '^' => Token::Xor,
+                '(' => Token::LParen,
+                ')' => Token::RParen,
+                '~' => Token::Not,
+                '!' => {
+                    match chars
+                        .next_if(|(_, c)| matches!(c, '^' | '|' | '&'))
+                        .map(|(_, c)| c)
+                    {
+                        Some('|') => Token::Nor,
+                        Some('&') => Token::Nand,
+                        Some('^') => Token::Xnor,
+                        _ => Token::Not,
+                    }
                 }
-            }
-            v if v.is_alphabetic() => Token::Var(v.to_ascii_uppercase()),
-            ws if ws.is_whitespace() => continue,
-            _ => return Err(TokenizingError::UnexpectedChar(ch, index)),
-        });
+                '<' => {
+                    if chars.next_if(|(_, c)| *c == '-').is_some() {
+                        if chars.next_if(|(_, c)| *c == '>').is_some() {
+                            Token::BiCond
+                        } else {
+                            Token::RevCond
+                        }
+                    } else {
+                        return Err(TokenizingError::unfinished_token(input, index + 1, '-'));
+                    }
+                }
+                '-' => {
+                    if chars.next_if(|(_, c)| *c == '>').is_some() {
+                        Token::Cond
+                    } else {
+                        return Err(TokenizingError::unfinished_token(input, index + 1, '>'));
+                    }
+                }
+                v if v.is_alphabetic() => Token::Var(v.to_ascii_uppercase()),
+                ws if ws.is_whitespace() => continue,
+                _ => {
+                    return Err(TokenizingError::unexpected_char(input, index, ch));
+                }
+            },
+        ));
     }
     Ok(tokens)
 }
@@ -173,44 +214,133 @@ fn combine_sort_unique<T: Ord + Clone + std::hash::Hash>(a: Vec<T>, b: Vec<T>) -
 
 fn bool_digit(b: bool) -> char {
     if b {
-        '1'
+        'T' //'1'
     } else {
-        '0'
+        'F' // '0'
     }
 }
 
 #[derive(Debug)]
-enum ParseError {
-    ReachedEOF,
-    ExpectedCloseParent,
-    UnexpectedToken,
-    UnparsedToken,
+struct ParseError {
+    src: Box<str>,
+    position: usize,
+    message: String,
+    // ReachedEOF,
+    // ExpectedCloseParent,
+    // UnexpectedToken,
+    // UnparsedToken,
+}
+
+impl ParseError {
+    fn _new(src: &str, position: usize, message: String) -> ParseError {
+        Self {
+            src: src.into(),
+            position,
+            message,
+        }
+    }
+
+    fn unexpected_eof(src: &str, position: usize) -> Self {
+        Self {
+            src: src.into(),
+            position,
+            message: "Unexpected EOF".to_string(),
+        }
+    }
+
+    fn expected_rparen(src: &str, position: usize) -> Self {
+        Self {
+            src: src.into(),
+            position,
+            message: "Expected `)`".to_string(),
+        }
+    }
+
+    fn unexpected_token(src: &str, position: usize, expected: &str, found: Token) -> Self {
+        Self {
+            src: src.into(),
+            position,
+            message: format!(
+                "Unexpected token `{found}` at index {position}, expected `{expected}`"
+            ),
+        }
+    }
+
+    fn unparsed_token(src: &str, position: usize, token: Token) -> Self {
+        Self {
+            src: src.into(),
+            position,
+            message: format!(
+                "Unexpected token `{token}` after finished expression, at index {position}"
+            ),
+        }
+    }
 }
 
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!("{self:?}"))
+        let ParseError {
+            src,
+            position,
+            message,
+        } = self;
+        f.write_fmt(format_args!(
+            "{message}\n{src}\n{spaces}^",
+            spaces = " ".repeat(*position)
+        ))
     }
 }
 
 impl std::error::Error for ParseError {}
 
 #[derive(Debug)]
-enum TokenizingError {
-    UnexpectedChar(char, usize),
+struct TokenizingError<'src> {
+    src: &'src str,
+    position: usize,
+    message: String,
 }
 
-impl std::fmt::Display for TokenizingError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TokenizingError::UnexpectedChar(char, index) => f.write_fmt(format_args!(
-                "Unexpected character `{char}` at index {index}"
-            )),
+impl<'src> TokenizingError<'src> {
+    fn _new(src: &'src str, position: usize, message: String) -> Self {
+        Self {
+            src,
+            position,
+            message,
+        }
+    }
+
+    fn unexpected_char(src: &'src str, position: usize, unexpected: char) -> Self {
+        Self {
+            src,
+            position,
+            message: format!("Unexpected character `{unexpected}` at index {position}"),
+        }
+    }
+
+    fn unfinished_token(src: &'src str, position: usize, expected: char) -> Self {
+        Self {
+            src,
+            position,
+            message: format!("Unfinished token at index {position}, expected `{expected}`"),
         }
     }
 }
 
-impl std::error::Error for TokenizingError {}
+impl std::fmt::Display for TokenizingError<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let TokenizingError {
+            src,
+            position,
+            message,
+        } = self;
+        f.write_fmt(format_args!(
+            "{message}\n{src}\n{spaces}^",
+            spaces = " ".repeat(*position)
+        ))
+    }
+}
+
+impl std::error::Error for TokenizingError<'_> {}
 
 struct Vars {
     names: Vec<char>,
@@ -250,47 +380,60 @@ impl Iterator for Vars {
     }
 }
 
-struct Parser<I: Iterator<Item = Token>> {
+struct Parser<'src, I: Iterator<Item = Located<Token>>> {
+    src: &'src str,
     tokens: std::iter::Peekable<I>,
 }
 
-impl<I: Iterator<Item = Token>> Parser<I> {
-    fn new(tokens: I) -> Self {
+impl<'src, I: Iterator<Item = Located<Token>>> Parser<'src, I> {
+    fn new(src: &'src str, tokens: I) -> Self {
         Self {
+            src,
             tokens: tokens.peekable(),
         }
     }
 
     pub fn expr(&mut self) -> Result<Op, ParseError> {
-        let expr = self.or();
-        if self.tokens.peek().is_some() {
-            Err(ParseError::UnparsedToken)
-        } else {
-            expr
+        let src = self.src;
+        let expr = self.or()?;
+        match self.tokens.next() {
+            Some((p, t)) => Err(ParseError::unparsed_token(src, p, t)),
+            None => Ok(expr),
         }
     }
 
     fn term(&mut self) -> Result<Op, ParseError> {
-        use ParseError::{ExpectedCloseParent, ReachedEOF, UnexpectedToken};
         use Token::{Const, LParen, RParen, Var};
 
-        match self.tokens.next().ok_or(ReachedEOF)? {
-            Const(b) => Ok(Op::Const(b)),
-            Var(c) => Ok(Op::Var(c)),
-            LParen => {
+        match self
+            .tokens
+            .next()
+            .ok_or_else(|| ParseError::unexpected_eof(self.src, self.src.len()))?
+        {
+            (_p, Const(b)) => Ok(Op::Const(b)),
+            (_p, Var(c)) => Ok(Op::Var(c)),
+            (_p, LParen) => {
                 let expr = self.or().map(|o| o);
                 self.tokens
-                    .next_if(|t| matches!(t, RParen))
-                    .ok_or(ExpectedCloseParent)
+                    .next_if(|(_p, t)| matches!(t, RParen))
+                    .ok_or_else(|| ParseError::expected_rparen(self.src, self.src.len()))
                     .and(expr)
             }
-            _ => Err(UnexpectedToken),
+            (p, t) => Err(ParseError::unexpected_token(
+                self.src,
+                p,
+                "a constant, a variable or an expression",
+                t,
+            )),
         }
     }
 
     fn or(&mut self) -> Result<Op, ParseError> {
         let mut lhs = self.and()?;
-        while let Some(tok) = self.tokens.next_if(|t| matches!(t, Token::Or | Token::Nor)) {
+        while let Some((_p, tok)) = self
+            .tokens
+            .next_if(|(_p, t)| matches!(t, Token::Or | Token::Nor))
+        {
             let rhs = self.and()?;
 
             lhs = match tok {
@@ -304,9 +447,9 @@ impl<I: Iterator<Item = Token>> Parser<I> {
 
     fn and(&mut self) -> Result<Op, ParseError> {
         let mut lhs = self.xor()?;
-        while let Some(tok) = self
+        while let Some((_p, tok)) = self
             .tokens
-            .next_if(|t| matches!(t, Token::And | Token::Nand))
+            .next_if(|(_p, t)| matches!(t, Token::And | Token::Nand))
         {
             let rhs = self.xor()?;
             lhs = match tok {
@@ -319,12 +462,12 @@ impl<I: Iterator<Item = Token>> Parser<I> {
     }
 
     fn xor(&mut self) -> Result<Op, ParseError> {
-        let mut lhs = self.not()?;
-        while let Some(tok) = self
+        let mut lhs = self.cond()?;
+        while let Some((_p, tok)) = self
             .tokens
-            .next_if(|t| matches!(t, Token::Xor | Token::Xnor))
+            .next_if(|(_p, t)| matches!(t, Token::Xor | Token::Xnor))
         {
-            let rhs = self.not()?;
+            let rhs = self.cond()?;
             lhs = match tok {
                 Token::Xor => Op::xor(lhs, rhs),
                 Token::Xnor => Op::not(Op::xor(lhs, rhs)),
@@ -334,8 +477,29 @@ impl<I: Iterator<Item = Token>> Parser<I> {
         Ok(lhs)
     }
 
+    fn cond(&mut self) -> Result<Op, ParseError> {
+        let mut lhs = self.not()?;
+        while let Some((_p, tok)) = self
+            .tokens
+            .next_if(|(_p, t)| matches!(t, Token::Cond | Token::BiCond | Token::RevCond))
+        {
+            let rhs = self.not()?;
+            lhs = match tok {
+                Token::BiCond => Op::bi_cond(lhs, rhs),
+                Token::RevCond => Op::rev_cond(lhs, rhs),
+                Token::Cond => Op::cond(lhs, rhs),
+                _ => unreachable!("Program enters here if tok is Cond, RevCond or BiCond"),
+            }
+        }
+        Ok(lhs)
+    }
+
     fn not(&mut self) -> Result<Op, ParseError> {
-        if self.tokens.next_if(|t| matches!(t, Token::Bang)).is_some() {
+        if self
+            .tokens
+            .next_if(|(_p, t)| matches!(t, Token::Not))
+            .is_some()
+        {
             self.not().map(Op::not)
         } else {
             self.term()
@@ -343,9 +507,11 @@ impl<I: Iterator<Item = Token>> Parser<I> {
     }
 }
 
+type Located<T> = (usize, T);
+
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 enum Token {
-    Bang,
+    Not,
     Or,
     Nor,
     And,
@@ -356,6 +522,31 @@ enum Token {
     RParen,
     Const(bool),
     Var(char),
+    BiCond,
+    RevCond,
+    Cond,
+}
+
+impl std::fmt::Display for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let str = match self {
+            Token::Not => "~",
+            Token::Or => "|",
+            Token::Nor => "!|",
+            Token::And => "&",
+            Token::Nand => "!&",
+            Token::Xor => "^",
+            Token::Xnor => "!^",
+            Token::LParen => "(",
+            Token::RParen => ")",
+            Token::Const(v) => &format!("{}", bool_digit(*v)),
+            Token::Var(name) => &name.to_string(),
+            Token::BiCond => "<->",
+            Token::RevCond => "<-",
+            Token::Cond => "->",
+        };
+        f.write_str(str)
+    }
 }
 
 #[derive(Debug, Eq, PartialEq, Clone)]
@@ -366,6 +557,9 @@ enum Op {
     Or { lhs: Box<Op>, rhs: Box<Op> },
     Xor { lhs: Box<Op>, rhs: Box<Op> },
     And { lhs: Box<Op>, rhs: Box<Op> },
+    Cond { lhs: Box<Op>, rhs: Box<Op> },
+    RevCond { lhs: Box<Op>, rhs: Box<Op> },
+    BiCond { lhs: Box<Op>, rhs: Box<Op> },
 }
 
 impl Op {
@@ -394,15 +588,39 @@ impl Op {
         }
     }
 
+    fn cond(lhs: Op, rhs: Op) -> Self {
+        Op::Cond {
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        }
+    }
+
+    fn rev_cond(lhs: Op, rhs: Op) -> Self {
+        Op::RevCond {
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        }
+    }
+
+    fn bi_cond(lhs: Op, rhs: Op) -> Self {
+        Op::BiCond {
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        }
+    }
+
     /// returns a list of variables, sorted in alphabetical order
     fn variables(&self) -> Vec<char> {
         match self {
             Op::Const(_) => Vec::new(),
             Op::Var(name) => vec![*name],
             Op::Not(op) => op.variables(),
-            Op::Or { lhs, rhs } | Op::And { lhs, rhs } | Op::Xor { lhs, rhs } => {
-                combine_sort_unique(lhs.variables(), rhs.variables())
-            }
+            Op::Or { lhs, rhs }
+            | Op::And { lhs, rhs }
+            | Op::Xor { lhs, rhs }
+            | Op::Cond { lhs, rhs }
+            | Op::RevCond { lhs, rhs }
+            | Op::BiCond { lhs, rhs } => combine_sort_unique(lhs.variables(), rhs.variables()),
         }
     }
 
@@ -416,6 +634,9 @@ impl Op {
             Op::Or { lhs, rhs } => Some((lhs.eval(vars)?) || (rhs.eval(vars)?)),
             Op::And { lhs, rhs } => Some((lhs.eval(vars)?) && (rhs.eval(vars)?)),
             Op::Xor { lhs, rhs } => Some((lhs.eval(vars)?) ^ (rhs.eval(vars)?)),
+            Op::Cond { lhs, rhs } => Some(cond(lhs.eval(vars)?, rhs.eval(vars)?)),
+            Op::RevCond { lhs, rhs } => Some(rev_cond(lhs.eval(vars)?, rhs.eval(vars)?)),
+            Op::BiCond { lhs, rhs } => Some(bi_cond(lhs.eval(vars)?, rhs.eval(vars)?)),
         }
     }
 
@@ -435,6 +656,7 @@ impl Op {
                         Op::or(Op::not(*lhs).simplify(), Op::not(*rhs).simplify())
                     }
                     op @ (Op::Var(_) | Op::Xor { .. }) => Op::Not(Box::new(op)),
+                    _ => Op::not(op),
                 }
             }
             Op::Or { lhs, rhs } => {
@@ -508,6 +730,11 @@ impl Op {
                     }
                 }
             }
+
+            //TODO: do some additional simplification checks
+            Op::Cond { lhs, rhs } => Op::cond(lhs.simplify(), rhs.simplify()),
+            Op::RevCond { lhs, rhs } => Op::rev_cond(lhs.simplify(), rhs.simplify()),
+            Op::BiCond { lhs, rhs } => Op::bi_cond(lhs.simplify(), rhs.simplify()),
         }
     }
 }
@@ -526,6 +753,9 @@ impl std::fmt::Display for Op {
             Op::Or { lhs, rhs } => f.write_str(&format!("({lhs} | {rhs})")),
             Op::And { lhs, rhs } => f.write_str(&format!("({lhs} & {rhs})")),
             Op::Xor { lhs, rhs } => f.write_str(&format!("({lhs} ^ {rhs})")),
+            Op::Cond { lhs, rhs } => f.write_str(&format!("({lhs} -> {rhs})")),
+            Op::RevCond { lhs, rhs } => f.write_str(&format!("({lhs} <- {rhs})")),
+            Op::BiCond { lhs, rhs } => f.write_str(&format!("({lhs} <-> {rhs})")),
         }
     }
 }
